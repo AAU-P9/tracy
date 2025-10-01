@@ -1068,6 +1068,18 @@ namespace tracy
                 UNREFERENCED(event);
                 break;
             }
+            case CUPTI_ACTIVITY_KIND_ENVIRONMENT:
+            {
+                CUpti_ActivityEnvironment *environment = (CUpti_ActivityEnvironment *)record;
+
+                if (environment->environmentKind == CUPTI_ACTIVITY_ENVIRONMENT_POWER) {
+                    ZoneNamedN(kernel, "tracy::CUDACtx::DoProcessDeviceEvent[power]", instrument);
+
+                    static constexpr const char* graph_name = "Power (mW) - CUPTI Event-based Sampling";
+                    tracyPlot(graph_name, static_cast<int64_t>(environment->data.power.power), environment->timestamp);
+                }
+                break;
+            }
             default:
             {
                 char buffer[64];
@@ -1094,6 +1106,7 @@ namespace tracy
             CUPTI_ACTIVITY_KIND_MEMSET,
             CUPTI_ACTIVITY_KIND_SYNCHRONIZATION,
             CUPTI_ACTIVITY_KIND_MEMORY2,
+            CUPTI_ACTIVITY_KIND_ENVIRONMENT,
             //CUPTI_ACTIVITY_KIND_MEMCPY2,
             //CUPTI_ACTIVITY_KIND_OVERHEAD,
             //CUPTI_ACTIVITY_KIND_INTERNAL_LAUNCH_API,
