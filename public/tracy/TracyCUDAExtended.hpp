@@ -56,6 +56,9 @@
 #    ifndef TRACY_CUDA_ENABLE_POWER_MONITORING
 #        define TRACY_CUDA_ENABLE_POWER_MONITORING ( 1 )
 #    endif
+#ifndef TRACY_CUDA_ENABLE_METRICS_PROFILING
+#    define TRACY_CUDA_ENABLE_METRICS_PROFILING ( 1 )
+#endif
 
 namespace
 {
@@ -1261,6 +1264,11 @@ class CUDACtx
             powerMonitor.Start();
 #    endif
 
+#if TRACY_CUDA_ENABLE_METRICS_PROFILING
+    auto& metricsProfiler = PersistentState::Get().metricsProfiler;
+    metricsProfiler.Initialize();
+#endif
+
 #    if TRACY_CUDA_ENABLE_COLLECTOR_THREAD
             auto& collector = PersistentState::Get().collector;
             collector.period = 160;
@@ -1286,6 +1294,11 @@ class CUDACtx
             auto& powerMonitor = PersistentState::Get().powerMonitor;
             powerMonitor.Stop();
 #    endif
+
+#if TRACY_CUDA_ENABLE_METRICS_PROFILING
+    auto& metricsProfiler = PersistentState::Get().metricsProfiler;
+    metricsProfiler.Shutdown();
+#endif
 
             auto& subscriber = PersistentState::Get().subscriber;
             for( auto activity : activities )
@@ -1438,6 +1451,241 @@ class CUDACtx
             ~PowerMonitor() { Stop(); }
         };
 #    endif // TRACY_CUDA_ENABLE_POWER_MONITORING
+#if TRACY_CUDA_ENABLE_METRICS_PROFILING
+        struct MetricsProfiler
+        {
+            static constexpr bool instrument = false;
+
+            std::atomic<bool> running = false;
+            CUcontext cuContext = nullptr;
+            CUdevice cuDevice = 0;
+            
+            // CUPTI profiler components
+            std::shared_ptr<CuptiProfilerHost> pCuptiProfilerHost;
+            std::shared_ptr<RangeProfilerTarget> pRangeProfilerTarget;
+            
+            // Configuration
+            RangeProfilerConfig config;
+            std::vector<const char*> metrics;
+            std::vector<uint8_t> configImage;
+            std::vector<uint8_t> counterDataImage;
+            std::vector<uint8_t> counterAvailabilityImage;
+            std::string chipName;
+            
+            // Range tracking
+            size_t currentRangeIndex = 0;
+            std::unordered_map<std::string, std::vector<double>> metricHistory;
+
+            MetricsProfiler()
+            {
+                // Default metrics - can be customized
+                metrics = {
+                    "sm__ctas_launched.sum",
+                    "sm__warps_active.sum",
+                    "lts__t_sectors_srcunit_tex_op_read.sum",
+                    "l1tex__t_requests_pipe_tex_mem_texture.sum",
+                    "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum",
+                    "l1tex__t_requests_pipe_lsu_mem_local_op_ld.sum",
+                    "lts__t_sector_hit_rate.pct",
+                    "l1tex__t_sector_hit_rate.pct",
+                };
+                
+                // Default configuration
+                config.maxNumOfRanges = 100;
+                config.minNestingLevel = 1;
+                config.numOfNestingLevel = 1;
+            }
+
+            void SetMetrics(const std::vector<const char*>& customMetrics)
+            {
+                ZoneNamedN(setMetrics, "MetricsProfiler::SetMetrics", instrument);
+                metrics = customMetrics;
+            }
+
+            void SetConfig(const RangeProfilerConfig& customConfig)
+            {
+                ZoneNamedN(setConfig, "MetricsProfiler::SetConfig", instrument);
+                config = customConfig;
+            }
+
+            void Initialize(CUcontext context = nullptr)
+            {
+                ZoneNamedN(init, "MetricsProfiler::Initialize", instrument);
+                
+                if (running.exchange(true))
+                {
+                    return; // Already initialized
+                }
+
+                // Get or use provided context
+                if (context == nullptr)
+                {
+                    DRIVER_API_CALL(cuCtxGetCurrent(&cuContext));
+                }
+                else
+                {
+                    cuContext = context;
+                }
+
+                // Get device
+                DRIVER_API_CALL(cuCtxGetDevice(&cuDevice));
+
+                // Initialize profiler host
+                pCuptiProfilerHost = std::make_shared<CuptiProfilerHost>();
+
+                // Get chip name
+                CUPTI_API_CALL(RangeProfilerTarget::GetChipName(cuDevice, chipName));
+                
+                // Get counter availability image
+                CUPTI_API_CALL(RangeProfilerTarget::GetCounterAvailabilityImage(
+                    cuContext, counterAvailabilityImage));
+
+                // Set up profiler host
+                pCuptiProfilerHost->SetUp(chipName, counterAvailabilityImage);
+                
+                // Create config image
+                CUPTI_API_CALL(pCuptiProfilerHost->CreateConfigImage(metrics, configImage));
+
+                // Create range profiler target
+                pRangeProfilerTarget = std::make_shared<RangeProfilerTarget>(cuContext, config);
+
+                // Enable range profiler
+                CUPTI_API_CALL(pRangeProfilerTarget->EnableRangeProfiler());
+
+                // Create counter data image
+                CUPTI_API_CALL(pRangeProfilerTarget->CreateCounterDataImage(
+                    metrics, counterDataImage));
+
+                // Set configuration
+                CUPTI_API_CALL(pRangeProfilerTarget->SetConfig(
+                    CUPTI_AutoRange,
+                    CUPTI_KernelReplay,
+                    configImage,
+                    counterDataImage));
+
+                fprintf(stdout, "Tracy CUDA: Metrics profiler initialized with %zu metrics\n", 
+                        metrics.size());
+            }
+
+            void BeginRange(const char* rangeName)
+            {
+                if (!running.load(std::memory_order_relaxed))
+                {
+                    return;
+                }
+
+                ZoneNamedN(beginRange, "MetricsProfiler::BeginRange", instrument);
+                
+                // Start range profiling
+                CUPTI_API_CALL(pRangeProfilerTarget->StartRangeProfiler());
+                
+                // Push range
+                CUPTI_API_CALL(pRangeProfilerTarget->PushRange(rangeName));
+            }
+
+            void EndRange()
+            {
+                if (!running.load(std::memory_order_relaxed))
+                {
+                    return;
+                }
+
+                ZoneNamedN(endRange, "MetricsProfiler::EndRange", instrument);
+                
+                // Pop range
+                CUPTI_API_CALL(pRangeProfilerTarget->PopRange());
+                
+                // Stop range profiling
+                CUPTI_API_CALL(pRangeProfilerTarget->StopRangeProfiler());
+            }
+
+            bool IsPassComplete()
+            {
+                if (!running.load(std::memory_order_relaxed))
+                {
+                    return true;
+                }
+                
+                return pRangeProfilerTarget->IsAllPassSubmitted();
+            }
+
+            void CollectAndReport()
+            {
+                if (!running.load(std::memory_order_relaxed))
+                {
+                    return;
+                }
+
+                ZoneNamedN(collect, "MetricsProfiler::CollectAndReport", instrument);
+                
+                // Decode counter data
+                CUPTI_API_CALL(pRangeProfilerTarget->DecodeCounterData());
+
+                // Get number of ranges
+                size_t numRanges = 0;
+                CUPTI_API_CALL(pCuptiProfilerHost->GetNumOfRanges(counterDataImage, numRanges));
+
+                // Evaluate counter data for all ranges
+                for (size_t rangeIndex = 0; rangeIndex < numRanges; ++rangeIndex)
+                {
+                    CUPTI_API_CALL(pCuptiProfilerHost->EvaluateCounterData(
+                        rangeIndex, metrics, counterDataImage));
+                }
+
+                // Print profiler ranges
+                pCuptiProfilerHost->PrintProfilerRanges();
+                
+                fprintf(stdout, "Tracy CUDA: Collected metrics for %zu ranges\n", numRanges);
+            }
+
+            void EmitMetricsToTracy(size_t rangeIndex)
+            {
+                if (!running.load(std::memory_order_relaxed))
+                {
+                    return;
+                }
+
+                ZoneNamedN(emit, "MetricsProfiler::EmitMetricsToTracy", instrument);
+                
+                // This would require extending CuptiProfilerHost to expose metric values
+                // For now, this is a placeholder for future implementation
+                // You would call TracyPlot() here for each metric value
+                
+                // Example (requires API extension in profiler.h):
+                // for (const auto& metric : metrics)
+                // {
+                //     double value = pCuptiProfilerHost->GetMetricValue(rangeIndex, metric);
+                //     TracyPlot(metric, static_cast<int64_t>(value));
+                // }
+            }
+
+            void Shutdown()
+            {
+                if (!running.exchange(false))
+                {
+                    return; // Already shut down
+                }
+
+                ZoneNamedN(shutdown, "MetricsProfiler::Shutdown", instrument);
+
+                // Collect final data
+                CollectAndReport();
+
+                // Disable range profiler
+                CUPTI_API_CALL(pRangeProfilerTarget->DisableRangeProfiler());
+                
+                // Tear down profiler host
+                pCuptiProfilerHost->TearDown();
+
+                fprintf(stdout, "Tracy CUDA: Metrics profiler shut down\n");
+            }
+
+            ~MetricsProfiler()
+            {
+                Shutdown();
+            }
+        };
+#endif // TRACY_CUDA_ENABLE_METRICS_PROFILING
 
         struct PersistentState
         {
@@ -1451,6 +1699,9 @@ class CUDACtx
 #    if TRACY_CUDA_ENABLE_POWER_MONITORING
             PowerMonitor powerMonitor;
 #    endif
+#if TRACY_CUDA_ENABLE_METRICS_PROFILING
+            MetricsProfiler metricsProfiler;
+#endif
 
             // NOTE(marcos): these objects do not need to persist, but their relative
             // footprint is trivial enough that we don't care if we let them leak
@@ -1552,6 +1803,25 @@ class CUDACtx
 #    define TracyCUDAStopProfiling( ctx ) ctx->StopProfiling()
 
 #    define TracyCUDACollect( ctx ) ctx->Collect()
+
+#if TRACY_CUDA_ENABLE_METRICS_PROFILING
+#    define TracyCUDAMetricsInit() \
+        tracy::CUDACtx::CUPTI::PersistentState::Get().metricsProfiler.Initialize()
+#    define TracyCUDAMetricsBeginRange(name) \
+        tracy::CUDACtx::CUPTI::PersistentState::Get().metricsProfiler.BeginRange(name)
+#    define TracyCUDAMetricsEndRange() \
+        tracy::CUDACtx::CUPTI::PersistentState::Get().metricsProfiler.EndRange()
+#    define TracyCUDAMetricsIsComplete() \
+        tracy::CUDACtx::CUPTI::PersistentState::Get().metricsProfiler.IsPassComplete()
+#    define TracyCUDAMetricsCollect() \
+        tracy::CUDACtx::CUPTI::PersistentState::Get().metricsProfiler.CollectAndReport()
+#else
+#    define TracyCUDAMetricsInit()
+#    define TracyCUDAMetricsBeginRange(name)
+#    define TracyCUDAMetricsEndRange()
+#    define TracyCUDAMetricsIsComplete() true
+#    define TracyCUDAMetricsCollect()
+#endif
 
 #endif
 
